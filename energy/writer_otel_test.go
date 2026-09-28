@@ -11,7 +11,7 @@ import (
 )
 
 func TestWriteReadings(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
+	reader := sdkmetric.NewManualReader(sdkmetric.WithTemporalitySelector(gaugeTemporality))
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 
 	writer, err := newOTelWriter(context.Background(), reader, "test-host", logger)
@@ -67,4 +67,50 @@ func TestWriteReadings(t *testing.T) {
 			t.Errorf("Metric %s: expected %v, got %v", name, expectedVal, actual)
 		}
 	}
+}
+
+func TestGaugesDoNotRepeatStaleValues(t *testing.T) {
+	reader := sdkmetric.NewManualReader(sdkmetric.WithTemporalitySelector(gaugeTemporality))
+
+	writer, err := newOTelWriter(context.Background(), reader, "test-host", nil)
+	if err != nil {
+		t.Fatalf("Failed to create OTelWriter: %v", err)
+	}
+	defer writer.Close()
+
+	if err := writer.WriteReadings([]Reading{{Commodity: ELECTRICITY, ReadingType: LIVE, Value: 42.5}}); err != nil {
+		t.Fatalf("WriteReadings failed: %v", err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+	if n := countDataPoints(t, rm); n != 1 {
+		t.Fatalf("Expected 1 data point after a reading, got %d", n)
+	}
+
+	// No new readings (e.g. upstream is down): the next collection must not
+	// report the old value again.
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+	if n := countDataPoints(t, rm); n != 0 {
+		t.Fatalf("Expected no data points without new readings, got %d", n)
+	}
+}
+
+func countDataPoints(t *testing.T, rm metricdata.ResourceMetrics) int {
+	t.Helper()
+	n := 0
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			gauge, ok := m.Data.(metricdata.Gauge[float64])
+			if !ok {
+				t.Fatalf("Metric %s is not a float64 gauge", m.Name)
+			}
+			n += len(gauge.DataPoints)
+		}
+	}
+	return n
 }

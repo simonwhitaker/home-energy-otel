@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
@@ -20,13 +21,24 @@ type OTelWriter struct {
 }
 
 func NewOTelWriter(ctx context.Context, hostname string, logger *log.Logger) (*OTelWriter, error) {
-	exporter, err := otlpmetricgrpc.New(ctx)
+	exporter, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithTemporalitySelector(gaugeTemporality))
 	if err != nil {
 		return nil, fmt.Errorf("creating OTLP exporter: %w", err)
 	}
 
 	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(10*time.Second))
 	return newOTelWriter(ctx, reader, hostname, logger)
+}
+
+// gaugeTemporality reports gauges with delta temporality. Under the SDK's
+// default cumulative temporality a gauge re-exports its last recorded value on
+// every collection, forever, so an upstream outage shows up downstream as a
+// flat line of stale readings instead of a gap.
+func gaugeTemporality(kind sdkmetric.InstrumentKind) metricdata.Temporality {
+	if kind == sdkmetric.InstrumentKindGauge {
+		return metricdata.DeltaTemporality
+	}
+	return sdkmetric.DefaultTemporalitySelector(kind)
 }
 
 func newOTelWriter(ctx context.Context, reader sdkmetric.Reader, hostname string, logger *log.Logger) (*OTelWriter, error) {
