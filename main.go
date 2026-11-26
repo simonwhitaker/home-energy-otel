@@ -3,95 +3,126 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/simonwhitaker/geo-energy-datadog/energy"
-)
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 
-type ReadingMode int
+	"github.com/simonwhitaker/home-energy-otel/energy"
+)
 
 const (
-	LIVE ReadingMode = 1 << iota
-	PERIODIC
+	healthServerAddr = ":8080"
+	mqttClientID     = "home-energy-otel"
+
+	// silenceThreshold is how long without an electricity message before we
+	// log that the display has gone quiet. The display publishes electricity
+	// roughly every 10s.
+	silenceThreshold     = 5 * time.Minute
+	silenceCheckInterval = 30 * time.Second
 )
 
-func (m ReadingMode) String() string {
-	switch m {
-	case LIVE:
-		return "live"
-	case PERIODIC:
-		return "periodic"
-	case LIVE | PERIODIC:
-		return "live and periodic"
-	default:
-		return "unknown"
+// ingester turns MQTT messages from a Glow display into readings and hands
+// them to every writer.
+type ingester struct {
+	logger  *log.Logger
+	writers []energy.EnergyDataWriter
+
+	mu sync.Mutex
+	// lastTimestamp holds the newest message timestamp seen per device and
+	// meter, so replayed (e.g. retained) or out-of-order messages are dropped.
+	lastTimestamp map[string]time.Time
+	// lastElectricity is when an electricity message last arrived (local
+	// clock), and silent whether we've already logged that it's gone quiet.
+	lastElectricity time.Time
+	silent          bool
+}
+
+func newIngester(logger *log.Logger, writers []energy.EnergyDataWriter, now time.Time) *ingester {
+	return &ingester{
+		logger:          logger,
+		writers:         writers,
+		lastTimestamp:   map[string]time.Time{},
+		lastElectricity: now,
 	}
 }
 
-const (
-	healthServerAddr         = ":8080"
-	liveReadinessTimeout     = time.Minute
-	periodicReadinessTimeout = 15 * time.Minute
-)
-
-type healthState struct {
-	ready          atomic.Bool
-	lastLiveOK     atomic.Int64
-	lastPeriodicOK atomic.Int64
-}
-
-func (h *healthState) markSuccess(mode ReadingMode) {
-	now := time.Now().Unix()
-
-	if mode&LIVE != 0 {
-		h.lastLiveOK.Store(now)
-	}
-	if mode&PERIODIC != 0 {
-		h.lastPeriodicOK.Store(now)
+func (i *ingester) handle(topic string, payload []byte, now time.Time) {
+	msg, err := energy.ParseGlowMessage(topic, payload)
+	if err != nil {
+		i.logger.Printf("Skipping message on %s: %v", topic, err)
+		return
 	}
 
-	h.ready.Store(true)
+	i.mu.Lock()
+	key := msg.Device + "/" + string(msg.Meter)
+	if last, seen := i.lastTimestamp[key]; seen && !msg.Timestamp.After(last) {
+		i.mu.Unlock()
+		return
+	}
+	i.lastTimestamp[key] = msg.Timestamp
+
+	if msg.Meter == energy.GlowElectricity {
+		if i.silent {
+			i.logger.Printf("Electricity data resumed after %v", now.Sub(i.lastElectricity).Truncate(time.Second))
+			i.silent = false
+		}
+		i.lastElectricity = now
+	}
+	i.mu.Unlock()
+
+	// Write to every writer even if one of them fails; a broken exporter
+	// shouldn't cost us the readings the others could have taken.
+	var errs []error
+	for _, w := range i.writers {
+		if err := w.WriteReadings(msg.Readings); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		i.logger.Printf("Error writing readings from %s: %v", topic, err)
+	}
 }
 
-func (h *healthState) livenessHandler(w http.ResponseWriter, _ *http.Request) {
+// checkSilence logs, once per run, when no electricity message has arrived
+// for silenceThreshold. It doesn't affect readiness: a quiet display isn't a
+// fault in this app.
+func (i *ingester) checkSilence(now time.Time) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if !i.silent && now.Sub(i.lastElectricity) > silenceThreshold {
+		i.silent = true
+		i.logger.Printf("No electricity data for %v", now.Sub(i.lastElectricity).Truncate(time.Second))
+	}
+}
+
+func livenessHandler(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
 
-func (h *healthState) readinessHandler(w http.ResponseWriter, _ *http.Request) {
-	if !h.ready.Load() {
-		http.Error(w, "not ready", http.StatusServiceUnavailable)
-		return
+// readinessHandler reports ready while connected to the MQTT broker.
+func readinessHandler(connected func() bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if !connected() {
+			http.Error(w, "not connected to MQTT broker", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
 	}
-
-	now := time.Now()
-	lastLiveOK := time.Unix(h.lastLiveOK.Load(), 0)
-	lastPeriodicOK := time.Unix(h.lastPeriodicOK.Load(), 0)
-
-	if now.Sub(lastLiveOK) > liveReadinessTimeout {
-		http.Error(w, "live readings stale", http.StatusServiceUnavailable)
-		return
-	}
-	if now.Sub(lastPeriodicOK) > periodicReadinessTimeout {
-		http.Error(w, "periodic readings stale", http.StatusServiceUnavailable)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
 }
 
-func startHealthServer(logger *log.Logger, health *healthState) *http.Server {
+func startHealthServer(logger *log.Logger, connected func() bool) *http.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", health.livenessHandler)
-	mux.HandleFunc("/readyz", health.readinessHandler)
+	mux.HandleFunc("/healthz", livenessHandler)
+	mux.HandleFunc("/readyz", readinessHandler(connected))
 
 	server := &http.Server{
 		Addr:    healthServerAddr,
@@ -108,144 +139,69 @@ func startHealthServer(logger *log.Logger, health *healthState) *http.Server {
 	return server
 }
 
-// getMeterData reads the requested data and hands it to every writer. It
-// returns the number of readings the upstream API had available.
-func getMeterData(reader energy.EnergyDataReader, writers []energy.EnergyDataWriter, mode ReadingMode) (int, error) {
-	allReadings := []energy.Reading{}
-
-	if mode&PERIODIC != 0 {
-		// Get periodic meter data
-		readings, err := reader.GetMeterReadings()
-		if err != nil {
-			return 0, err
-		}
-		allReadings = append(allReadings, readings...)
-	}
-	if mode&LIVE != 0 {
-		// Get live meter data
-		readings, err := reader.GetLiveReadings()
-		if err != nil {
-			return 0, err
-		}
-
-		allReadings = append(allReadings, readings...)
+func newMQTTClient(logger *log.Logger, ing *ingester, brokerURL, username, password, topicPrefix string) mqtt.Client {
+	topics := map[string]byte{
+		topicPrefix + "/+/STATE":    1,
+		topicPrefix + "/+/SENSOR/+": 1,
 	}
 
-	// Write to every writer even if one of them fails; a broken exporter
-	// shouldn't cost us the readings the others could have taken.
-	var writeErrs []error
-	for _, w := range writers {
-		if err := w.WriteReadings(allReadings); err != nil {
-			writeErrs = append(writeErrs, err)
-		}
-	}
+	opts := mqtt.NewClientOptions().
+		AddBroker(brokerURL).
+		SetClientID(mqttClientID).
+		SetUsername(username).
+		SetPassword(password).
+		SetCleanSession(false).
+		SetAutoReconnect(true).
+		SetMaxReconnectInterval(2 * time.Minute).
+		SetConnectionLostHandler(func(_ mqtt.Client, err error) {
+			logger.Printf("Lost connection to MQTT broker: %v", err)
+		}).
+		SetReconnectingHandler(func(mqtt.Client, *mqtt.ClientOptions) {
+			logger.Println("Reconnecting to MQTT broker...")
+		}).
+		SetOnConnectHandler(func(c mqtt.Client) {
+			logger.Printf("Connected to MQTT broker %s", brokerURL)
+			// Subscribe on every (re)connect: the broker may have lost the
+			// session.
+			token := c.SubscribeMultiple(topics, func(_ mqtt.Client, m mqtt.Message) {
+				ing.handle(m.Topic(), m.Payload(), time.Now())
+			})
+			go func() {
+				if token.Wait() && token.Error() != nil {
+					logger.Printf("Subscribing to %v failed: %v", topics, token.Error())
+				}
+			}()
+		})
 
-	return len(allReadings), errors.Join(writeErrs...)
+	return mqtt.NewClient(opts)
 }
 
-// poller reads from the meter on demand and keeps the health state in step
-// with whether data is actually flowing.
-type poller struct {
-	logger     *log.Logger
-	health     *healthState
-	reader     energy.EnergyDataReader
-	writers    []energy.EnergyDataWriter
-	silentFrom map[ReadingMode]time.Time
-}
-
-func newPoller(logger *log.Logger, health *healthState, reader energy.EnergyDataReader, writers []energy.EnergyDataWriter) *poller {
-	return &poller{
-		logger:     logger,
-		health:     health,
-		reader:     reader,
-		writers:    writers,
-		silentFrom: map[ReadingMode]time.Time{},
-	}
-}
-
-// poll fetches and writes one round of readings. A panic below this point (the
-// upstream client dereferences a nil response when the transport fails) is
-// turned into an error rather than being allowed to kill the process.
-func (p *poller) poll(mode ReadingMode) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic while reading %v data: %v", mode, r)
-		}
-	}()
-
-	count, err := getMeterData(p.reader, p.writers, mode)
-	if err != nil {
-		return err
-	}
-
-	if count == 0 {
-		// The API answers 200 with nothing in it while it's degraded. Don't
-		// report that as a success: let readiness go stale instead of
-		// claiming health while no data is flowing.
-		p.noteSilence(mode)
-		return nil
-	}
-
-	p.noteReadings(mode)
-	p.health.markSuccess(mode)
-	return nil
-}
-
-// noteSilence logs the start of a run of empty responses, once per run.
-func (p *poller) noteSilence(mode ReadingMode) {
-	if _, alreadySilent := p.silentFrom[mode]; alreadySilent {
-		return
-	}
-
-	p.silentFrom[mode] = time.Now()
-	p.logger.Printf("No %v readings available from upstream", mode)
-}
-
-func (p *poller) noteReadings(mode ReadingMode) {
-	if since, wasSilent := p.silentFrom[mode]; wasSilent {
-		p.logger.Printf("%v readings resumed after %v", mode, time.Since(since).Truncate(time.Second))
-		delete(p.silentFrom, mode)
-	}
-}
-
-// waitForConnection retries the first read with exponential backoff until it
-// succeeds, or until ctx is cancelled. It reports whether it connected.
-func waitForConnection(ctx context.Context, logger *log.Logger, p *poller) bool {
-	backoff := time.Second * 5
-	maxBackoff := time.Minute * 2
+// connectWithRetry makes the first connection to the broker, retrying with
+// capped exponential backoff and logging why each attempt failed (paho's own
+// ConnectRetry option retries silently, hiding e.g. a wrong password).
+func connectWithRetry(ctx context.Context, logger *log.Logger, client mqtt.Client) {
+	backoff := 5 * time.Second
+	const maxBackoff = 2 * time.Minute
 
 	for {
-		err := p.poll(LIVE | PERIODIC)
-		if err == nil {
-			logger.Println("Connected successfully")
-			return true
+		token := client.Connect()
+		token.Wait()
+		if token.Error() == nil {
+			return
 		}
 
-		logger.Printf("Connection failed: %v (retrying in %v)", err, backoff)
-
-		// Stay responsive to shutdown while we're waiting to retry.
+		logger.Printf("Connecting to MQTT broker failed: %v (retrying in %v)", token.Error(), backoff)
 		select {
 		case <-ctx.Done():
-			return false
+			return
 		case <-time.After(backoff):
 		}
-
-		// Exponential backoff with cap
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
 func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
-	health := &healthState{}
-
-	// Configure reader
-	geoUsername := os.Getenv("GEO_USERNAME")
-	geoPassword := os.Getenv("GEO_PASSWORD")
-	reader := energy.NewGeoEnergyDataReader(geoUsername, geoPassword)
 
 	// Configure writers
 	writers := []energy.EnergyDataWriter{
@@ -263,43 +219,37 @@ func main() {
 		logger.Println("Skipping OTel; OTEL_EXPORTER_OTLP_ENDPOINT not set")
 	}
 
-	healthServer := startHealthServer(logger, health)
+	ing := newIngester(logger, writers, time.Now())
+	client := newMQTTClient(logger, ing,
+		getEnvOrDefault("MQTT_BROKER_URL", "tcp://mosquitto:1883"),
+		os.Getenv("MQTT_USERNAME"),
+		os.Getenv("MQTT_PASSWORD"),
+		getEnvOrDefault("MQTT_TOPIC_PREFIX", "glow"),
+	)
 
-	// Shut down cleanly on SIGINT or SIGTERM, including while we're still
-	// retrying the initial connection.
+	healthServer := startHealthServer(logger, client.IsConnectionOpen)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	p := newPoller(logger, health, reader, writers)
+	// Readiness reports the connection state while we retry. Once connected,
+	// paho's auto-reconnect takes over.
+	go connectWithRetry(ctx, logger, client)
 
-	// Wait for initial connection with retry
-	if waitForConnection(ctx, logger, p) {
-		tickLive := time.NewTicker(time.Second * time.Duration(10))
-		tickPeriodic := time.NewTicker(time.Second * time.Duration(300))
-		defer tickLive.Stop()
-		defer tickPeriodic.Stop()
-
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-tickLive.C:
-					if err := p.poll(LIVE); err != nil {
-						logger.Printf("Error getting live data: %v", err)
-					}
-				case <-tickPeriodic.C:
-					if err := p.poll(PERIODIC); err != nil {
-						logger.Printf("Error getting periodic data: %v", err)
-					}
-				}
-			}
-		}()
-
-		<-ctx.Done()
+	ticker := time.NewTicker(silenceCheckInterval)
+	defer ticker.Stop()
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			break loop
+		case now := <-ticker.C:
+			ing.checkSilence(now)
+		}
 	}
 
 	logger.Println("Shutting down...")
+	client.Disconnect(250)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := healthServer.Shutdown(shutdownCtx); err != nil {

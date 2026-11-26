@@ -8,12 +8,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o /geo-energy-otel
+RUN CGO_ENABLED=0 GOOS=linux go build -o /home-energy-otel
 
 FROM alpine:3.18.2
 
 WORKDIR /
 
-COPY --from=build /geo-energy-otel /geo-energy-otel
+COPY --from=build /home-energy-otel /home-energy-otel
 
-ENTRYPOINT [ "/geo-energy-otel" ]
+ENTRYPOINT [ "/home-energy-otel" ]

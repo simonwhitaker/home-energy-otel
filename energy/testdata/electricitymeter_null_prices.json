@@ -1,0 +1,1 @@
+{"electricitymeter":{"timestamp":"2022-06-11T20:38:10Z","energy":{"export":{"cumulative":0.000,"units":"kWh"},"import":{"cumulative":6613.410,"day":13.257,"week":141.715,"month":293.603,"units":"kWh","mpan":"1234","supplier":"ABC ENERGY","price":{"unitrate":null,"standingcharge":null}}},"power":{"value":1.2,"units":"kW"}}}

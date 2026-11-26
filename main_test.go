@@ -1,179 +1,156 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/simonwhitaker/geo-energy-datadog/energy"
+	"github.com/simonwhitaker/home-energy-otel/energy"
 )
 
-func TestReadinessHandlerReturnsUnavailableBeforeInitialSuccess(t *testing.T) {
-	health := &healthState{}
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	rec := httptest.NewRecorder()
+const (
+	elecTopic = "glow/ABCDEF012345/SENSOR/electricitymeter"
+	gasTopic  = "glow/ABCDEF012345/SENSOR/gasmeter"
+)
 
-	health.readinessHandler(rec, req)
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
-	}
+func elecPayload(ts string, kw float64) []byte {
+	return []byte(`{"electricitymeter":{"timestamp":"` + ts + `","energy":{"import":{"cumulative":6613.405,"price":{"unitrate":null,"standingcharge":null}}},"power":{"value":` +
+		strconv.FormatFloat(kw, 'f', -1, 64) + `}}}`)
 }
 
-func TestReadinessHandlerReturnsOKAfterRecentSuccess(t *testing.T) {
-	health := &healthState{}
-	health.markSuccess(LIVE | PERIODIC)
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	rec := httptest.NewRecorder()
-
-	health.readinessHandler(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
-	}
+func gasPayload(ts string) []byte {
+	return []byte(`{"gasmeter":{"timestamp":"` + ts + `","energy":{"import":{"cumulative":17940.852,"price":{"unitrate":null,"standingcharge":null}}},"power":{"value":0}}}`)
 }
-
-func TestReadinessHandlerReturnsUnavailableWhenLiveReadingsAreStale(t *testing.T) {
-	now := time.Now()
-	health := &healthState{}
-	health.ready.Store(true)
-	health.lastLiveOK.Store(now.Add(-liveReadinessTimeout - time.Second).Unix())
-	health.lastPeriodicOK.Store(now.Unix())
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	rec := httptest.NewRecorder()
-
-	health.readinessHandler(rec, req)
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
-	}
-}
-
-func TestReadinessHandlerReturnsUnavailableWhenPeriodicReadingsAreStale(t *testing.T) {
-	now := time.Now()
-	health := &healthState{}
-	health.ready.Store(true)
-	health.lastLiveOK.Store(now.Unix())
-	health.lastPeriodicOK.Store(now.Add(-periodicReadinessTimeout - time.Second).Unix())
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	rec := httptest.NewRecorder()
-
-	health.readinessHandler(rec, req)
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, rec.Code)
-	}
-}
-
-type fakeReader struct {
-	live     []energy.Reading
-	meter    []energy.Reading
-	err      error
-	panicMsg string
-	calls    int
-}
-
-func (f *fakeReader) readings(r []energy.Reading) ([]energy.Reading, error) {
-	f.calls++
-	if f.panicMsg != "" {
-		panic(f.panicMsg)
-	}
-	return r, f.err
-}
-
-func (f *fakeReader) GetLiveReadings() ([]energy.Reading, error)  { return f.readings(f.live) }
-func (f *fakeReader) GetMeterReadings() ([]energy.Reading, error) { return f.readings(f.meter) }
 
 type fakeWriter struct {
-	written []energy.Reading
+	written [][]energy.Reading
 	err     error
 }
 
 func (w *fakeWriter) WriteReadings(r []energy.Reading) error {
-	w.written = append(w.written, r...)
+	w.written = append(w.written, r)
 	return w.err
 }
 
 func (w *fakeWriter) Close() error { return nil }
 
-func newTestPoller(reader energy.EnergyDataReader, writers ...energy.EnergyDataWriter) *poller {
-	logger := log.New(io.Discard, "", 0)
-	return newPoller(logger, &healthState{}, reader, writers)
+func newTestIngester(writers ...energy.EnergyDataWriter) (*ingester, *bytes.Buffer, *time.Time) {
+	var buf bytes.Buffer
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	ing := newIngester(log.New(&buf, "", 0), writers, now)
+	return ing, &buf, &now
 }
 
-func TestPollTurnsAPanicIntoAnError(t *testing.T) {
-	p := newTestPoller(&fakeReader{panicMsg: "runtime error: invalid memory address or nil pointer dereference"})
-
-	err := p.poll(LIVE)
-
-	if err == nil {
-		t.Fatal("expected an error, got nil")
-	}
-	if !strings.Contains(err.Error(), "panic while reading live data") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if p.health.ready.Load() {
-		t.Fatal("expected the app to stay unready after a panic")
-	}
-}
-
-func TestPollDoesNotMarkSuccessWhenUpstreamHasNoReadings(t *testing.T) {
-	p := newTestPoller(&fakeReader{live: []energy.Reading{}})
-
-	if err := p.poll(LIVE); err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if p.health.ready.Load() {
-		t.Fatal("expected the app to stay unready when no readings are available")
-	}
-}
-
-func TestPollMarksSuccessWhenReadingsArrive(t *testing.T) {
-	reader := &fakeReader{live: []energy.Reading{{Commodity: energy.ELECTRICITY, ReadingType: energy.LIVE, Value: 420}}}
-	writer := &fakeWriter{}
-	p := newTestPoller(reader, writer)
-
-	if err := p.poll(LIVE); err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if !p.health.ready.Load() {
-		t.Fatal("expected the app to be ready after a successful read")
-	}
-	if len(writer.written) != 1 {
-		t.Fatalf("expected 1 reading to be written, got %d", len(writer.written))
-	}
-}
-
-func TestGetMeterDataWritesToEveryWriterEvenWhenOneFails(t *testing.T) {
-	reader := &fakeReader{live: []energy.Reading{{Commodity: energy.GAS, ReadingType: energy.LIVE, Value: 1448}}}
+func TestIngestWritesParsedReadingsToEveryWriter(t *testing.T) {
 	failing := &fakeWriter{err: errors.New("exporter down")}
 	working := &fakeWriter{}
+	ing, logs, now := newTestIngester(failing, working)
 
-	count, err := getMeterData(reader, []energy.EnergyDataWriter{failing, working}, LIVE)
+	ing.handle(elecTopic, elecPayload("2026-11-26T12:00:00Z", 0.951), *now)
 
-	if err == nil {
-		t.Fatal("expected the writer error to be reported")
-	}
-	if count != 1 {
-		t.Fatalf("expected 1 reading, got %d", count)
-	}
 	if len(working.written) != 1 {
-		t.Fatal("expected the healthy writer to still receive the reading")
+		t.Fatalf("expected the healthy writer to get 1 batch, got %d", len(working.written))
+	}
+	if len(failing.written) != 1 {
+		t.Fatalf("expected the failing writer to still be called")
+	}
+	if !strings.Contains(logs.String(), "exporter down") {
+		t.Fatalf("expected the writer error to be logged, got %q", logs.String())
 	}
 }
 
-func TestWaitForConnectionGivesUpWhenContextIsCancelled(t *testing.T) {
-	p := newTestPoller(&fakeReader{err: errors.New("Response Code: 502")})
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+func TestIngestDropsMessagesThatAreNotNewer(t *testing.T) {
+	w := &fakeWriter{}
+	ing, _, now := newTestIngester(w)
 
-	if waitForConnection(ctx, log.New(io.Discard, "", 0), p) {
-		t.Fatal("expected waitForConnection to report failure on a cancelled context")
+	ing.handle(elecTopic, elecPayload("2026-11-26T12:00:10Z", 1), *now)
+	ing.handle(elecTopic, elecPayload("2026-11-26T12:00:10Z", 1), *now) // replayed (e.g. retained)
+	ing.handle(elecTopic, elecPayload("2026-11-26T12:00:00Z", 1), *now) // older
+	ing.handle(elecTopic, elecPayload("2026-11-26T12:00:20Z", 1), *now) // newer
+
+	if len(w.written) != 2 {
+		t.Fatalf("expected 2 batches written, got %d", len(w.written))
+	}
+}
+
+func TestIngestTracksTimestampsPerMeter(t *testing.T) {
+	w := &fakeWriter{}
+	ing, _, now := newTestIngester(w)
+
+	ing.handle(elecTopic, elecPayload("2026-11-26T12:00:10Z", 1), *now)
+	// Gas is older than the latest electricity message but is the first gas
+	// message, so it must still go through.
+	ing.handle(gasTopic, gasPayload("2026-11-26T11:30:00Z"), *now)
+
+	if len(w.written) != 2 {
+		t.Fatalf("expected 2 batches written, got %d", len(w.written))
+	}
+}
+
+func TestIngestLogsAndSkipsUnparseableMessages(t *testing.T) {
+	w := &fakeWriter{}
+	ing, logs, now := newTestIngester(w)
+
+	ing.handle(elecTopic, []byte("{not json"), *now)
+
+	if len(w.written) != 0 {
+		t.Fatal("expected nothing written")
+	}
+	if !strings.Contains(logs.String(), elecTopic) {
+		t.Fatalf("expected the topic in the log, got %q", logs.String())
+	}
+}
+
+func TestSilenceIsLoggedOnceAndResumptionIsLogged(t *testing.T) {
+	ing, logs, start := newTestIngester(&fakeWriter{})
+
+	ing.checkSilence(start.Add(silenceThreshold - time.Second))
+	if logs.Len() != 0 {
+		t.Fatalf("expected no log before the threshold, got %q", logs.String())
+	}
+
+	ing.checkSilence(start.Add(silenceThreshold + time.Second))
+	ing.checkSilence(start.Add(silenceThreshold + time.Minute))
+	if n := strings.Count(logs.String(), "No electricity data"); n != 1 {
+		t.Fatalf("expected exactly one silence warning, got %d in %q", n, logs.String())
+	}
+
+	ing.handle(elecTopic, elecPayload("2026-11-26T12:10:00Z", 1), start.Add(10*time.Minute))
+	if !strings.Contains(logs.String(), "Electricity data resumed after 10m0s") {
+		t.Fatalf("expected a resumption log, got %q", logs.String())
+	}
+}
+
+func TestGasMessagesDoNotCountAsElectricityData(t *testing.T) {
+	ing, logs, start := newTestIngester(&fakeWriter{})
+
+	ing.handle(gasTopic, gasPayload("2026-11-26T12:04:00Z"), start.Add(4*time.Minute))
+	ing.checkSilence(start.Add(silenceThreshold + time.Second))
+
+	if !strings.Contains(logs.String(), "No electricity data") {
+		t.Fatalf("expected a silence warning, got %q", logs.String())
+	}
+}
+
+func TestReadinessFollowsBrokerConnection(t *testing.T) {
+	for _, tc := range []struct {
+		connected bool
+		want      int
+	}{
+		{true, http.StatusOK},
+		{false, http.StatusServiceUnavailable},
+	} {
+		h := readinessHandler(func() bool { return tc.connected })
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if rec.Code != tc.want {
+			t.Errorf("connected=%v: expected %d, got %d", tc.connected, tc.want, rec.Code)
+		}
 	}
 }

@@ -7,6 +7,12 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://hyperdx:4317
     depends_on:
       - hyperdx
+      - mosquitto
+
+  mosquitto:
+    extends:
+      file: docker-compose.yml
+      service: mosquitto
 
   hyperdx:
     image: hyperdx/hyperdx-local:latest
@@ -20,5 +26,6 @@ services:
       dev.orbstack.http-port: 8080
 
 volumes:
+  mosquitto_data:
   hyperdx_data:
   hyperdx_clickhouse_data:
