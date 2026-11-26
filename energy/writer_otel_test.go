@@ -2,115 +2,150 @@ package energy
 
 import (
 	"context"
-	"log"
-	"os"
+	"errors"
 	"testing"
 
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-func TestWriteReadings(t *testing.T) {
-	reader := sdkmetric.NewManualReader(sdkmetric.WithTemporalitySelector(gaugeTemporality))
-	logger := log.New(os.Stdout, "", log.LstdFlags)
+type exportedPoint struct {
+	Unit  string
+	Value float64
+}
 
-	writer, err := newOTelWriter(context.Background(), reader, "test-host", logger)
-	if err != nil {
-		t.Fatalf("Failed to create OTelWriter: %v", err)
-	}
-	defer writer.Close()
+// fakeExporter records what each Export call carried.
+type fakeExporter struct {
+	exports []map[string]exportedPoint
+	err     error
+}
 
-	readings := []Reading{
-		{Commodity: ELECTRICITY, ReadingType: LIVE, Value: 42.5},
-		{Commodity: GAS, ReadingType: LIVE, Value: 10.0},
-		{Commodity: ELECTRICITY, ReadingType: METER, Value: 1234.56},
-		{Commodity: GAS, ReadingType: METER, Value: 789.0},
-	}
+func (e *fakeExporter) Temporality(k sdkmetric.InstrumentKind) metricdata.Temporality {
+	return gaugeTemporality(k)
+}
 
-	if err := writer.WriteReadings(readings); err != nil {
-		t.Fatalf("WriteReadings failed: %v", err)
-	}
+func (e *fakeExporter) Aggregation(k sdkmetric.InstrumentKind) sdkmetric.Aggregation {
+	return sdkmetric.DefaultAggregationSelector(k)
+}
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("Collect failed: %v", err)
-	}
-
-	expected := map[string]float64{
-		"energy.live.electricity":  42.5,
-		"energy.live.gas":          10.0,
-		"energy.meter.electricity": 1234.56,
-		"energy.meter.gas":         789.0,
-	}
-
-	found := make(map[string]float64)
+func (e *fakeExporter) Export(_ context.Context, rm *metricdata.ResourceMetrics) error {
+	points := map[string]exportedPoint{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			gauge, ok := m.Data.(metricdata.Gauge[float64])
 			if !ok {
-				t.Fatalf("Metric %s is not a float64 gauge", m.Name)
+				continue
 			}
-			if len(gauge.DataPoints) != 1 {
-				t.Fatalf("Expected 1 data point for %s, got %d", m.Name, len(gauge.DataPoints))
+			for _, dp := range gauge.DataPoints {
+				points[m.Name] = exportedPoint{Unit: m.Unit, Value: dp.Value}
 			}
-			found[m.Name] = gauge.DataPoints[0].Value
 		}
 	}
-
-	for name, expectedVal := range expected {
-		actual, ok := found[name]
-		if !ok {
-			t.Errorf("Missing metric: %s", name)
-			continue
-		}
-		if actual != expectedVal {
-			t.Errorf("Metric %s: expected %v, got %v", name, expectedVal, actual)
-		}
-	}
+	e.exports = append(e.exports, points)
+	return e.err
 }
 
-func TestGaugesDoNotRepeatStaleValues(t *testing.T) {
-	reader := sdkmetric.NewManualReader(sdkmetric.WithTemporalitySelector(gaugeTemporality))
+func (e *fakeExporter) ForceFlush(context.Context) error { return nil }
+func (e *fakeExporter) Shutdown(context.Context) error   { return nil }
 
-	writer, err := newOTelWriter(context.Background(), reader, "test-host", nil)
-	if err != nil {
-		t.Fatalf("Failed to create OTelWriter: %v", err)
-	}
-	defer writer.Close()
-
-	if err := writer.WriteReadings([]Reading{{Commodity: ELECTRICITY, ReadingType: LIVE, Value: 42.5}}); err != nil {
-		t.Fatalf("WriteReadings failed: %v", err)
-	}
-
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("Collect failed: %v", err)
-	}
-	if n := countDataPoints(t, rm); n != 1 {
-		t.Fatalf("Expected 1 data point after a reading, got %d", n)
-	}
-
-	// No new readings (e.g. upstream is down): the next collection must not
-	// report the old value again.
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("Collect failed: %v", err)
-	}
-	if n := countDataPoints(t, rm); n != 0 {
-		t.Fatalf("Expected no data points without new readings, got %d", n)
-	}
-}
-
-func countDataPoints(t *testing.T, rm metricdata.ResourceMetrics) int {
+func newTestOTelWriter(t *testing.T, exp *fakeExporter) *OTelWriter {
 	t.Helper()
-	n := 0
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			gauge, ok := m.Data.(metricdata.Gauge[float64])
-			if !ok {
-				t.Fatalf("Metric %s is not a float64 gauge", m.Name)
-			}
-			n += len(gauge.DataPoints)
+	w, err := newOTelWriter(context.Background(), exp, "test-host", nil)
+	if err != nil {
+		t.Fatalf("creating OTelWriter: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	return w
+}
+
+func TestWriteReadingsExportsImmediatelyWithUnits(t *testing.T) {
+	exp := &fakeExporter{}
+	w := newTestOTelWriter(t, exp)
+
+	err := w.WriteReadings([]Reading{
+		{Metric: LivePowerElectricity, Value: 951},
+		{Metric: MeterElectricity, Value: 6613.405},
+	})
+	if err != nil {
+		t.Fatalf("WriteReadings failed: %v", err)
+	}
+
+	if len(exp.exports) != 1 {
+		t.Fatalf("expected 1 export, got %d", len(exp.exports))
+	}
+	want := map[string]exportedPoint{
+		"energy.live.electricity":  {Unit: "W", Value: 951},
+		"energy.meter.electricity": {Unit: "kW.h", Value: 6613.405},
+	}
+	got := exp.exports[0]
+	if len(got) != len(want) {
+		t.Fatalf("expected %d points, got %v", len(want), got)
+	}
+	for name, w := range want {
+		if got[name] != w {
+			t.Errorf("%s: expected %+v, got %+v", name, w, got[name])
 		}
 	}
-	return n
+}
+
+func TestEveryWriteIsExportedSoNoSampleIsLost(t *testing.T) {
+	exp := &fakeExporter{}
+	w := newTestOTelWriter(t, exp)
+
+	for _, v := range []float64{100, 200} {
+		if err := w.WriteReadings([]Reading{{Metric: LivePowerElectricity, Value: v}}); err != nil {
+			t.Fatalf("WriteReadings failed: %v", err)
+		}
+	}
+
+	if len(exp.exports) != 2 {
+		t.Fatalf("expected 2 exports, got %d", len(exp.exports))
+	}
+	if v := exp.exports[0]["energy.live.electricity"].Value; v != 100 {
+		t.Errorf("first export: expected 100, got %v", v)
+	}
+	if v := exp.exports[1]["energy.live.electricity"].Value; v != 200 {
+		t.Errorf("second export: expected 200, got %v", v)
+	}
+}
+
+func TestWritesDoNotRepeatEarlierValues(t *testing.T) {
+	exp := &fakeExporter{}
+	w := newTestOTelWriter(t, exp)
+
+	if err := w.WriteReadings([]Reading{{Metric: MeterGas, Value: 17940.852}}); err != nil {
+		t.Fatalf("WriteReadings failed: %v", err)
+	}
+	if err := w.WriteReadings([]Reading{{Metric: LivePowerElectricity, Value: 951}}); err != nil {
+		t.Fatalf("WriteReadings failed: %v", err)
+	}
+
+	second := exp.exports[1]
+	if _, ok := second["energy.meter.gas"]; ok {
+		t.Fatal("gas reading from the first write was exported again")
+	}
+	if len(second) != 1 {
+		t.Fatalf("expected only the new reading, got %v", second)
+	}
+}
+
+func TestWriteReadingsReturnsExportErrors(t *testing.T) {
+	exp := &fakeExporter{err: errors.New("collector down")}
+	w := newTestOTelWriter(t, exp)
+
+	if err := w.WriteReadings([]Reading{{Metric: LivePowerElectricity, Value: 951}}); err == nil {
+		t.Fatal("expected the export error to be returned")
+	}
+}
+
+func TestWriteReadingsWithNothingToWriteDoesNotExport(t *testing.T) {
+	exp := &fakeExporter{}
+	w := newTestOTelWriter(t, exp)
+
+	if err := w.WriteReadings(nil); err != nil {
+		t.Fatalf("WriteReadings failed: %v", err)
+	}
+	if len(exp.exports) != 0 {
+		t.Fatalf("expected no export, got %d", len(exp.exports))
+	}
 }

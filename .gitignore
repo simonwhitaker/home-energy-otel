@@ -24,3 +24,6 @@
 go.work
 .env
 *.env
+
+# Mosquitto credentials (see README)
+mosquitto/passwd

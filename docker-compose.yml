@@ -3,10 +3,14 @@ services:
     build:
       context: .
     environment:
-      - GEO_USERNAME
-      - GEO_PASSWORD
+      - MQTT_BROKER_URL
+      - MQTT_USERNAME
+      - MQTT_PASSWORD
+      - MQTT_TOPIC_PREFIX
       - OTEL_EXPORTER_OTLP_ENDPOINT
       - OTEL_HOSTNAME
+    depends_on:
+      - mosquitto
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/readyz || exit 1"]
@@ -20,3 +24,19 @@ services:
           memory: 500M
     logging:
       driver: local
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    # Published on the host so the Glow display can reach it over your LAN.
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd:ro
+      - mosquitto_data:/mosquitto/data
+    restart: unless-stopped
+    logging:
+      driver: local
+
+volumes:
+  mosquitto_data:
